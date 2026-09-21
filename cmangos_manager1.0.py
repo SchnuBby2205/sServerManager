@@ -40,14 +40,23 @@ import json
 import os
 import queue
 import re
+import select
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import pty   # nur Unix (Linux/macOS) - für 'docker attach' an TTY-Container benötigt
+    import tty   # setzt das Pseudo-Terminal in den Raw-Modus (siehe start_pty())
+    HAVE_PTY = True
+except ImportError:
+    HAVE_PTY = False
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -95,6 +104,13 @@ class PortDef:
 
 
 @dataclass(frozen=True)
+class ContainerRole:
+    key: str            # interner Schlüssel, z.B. "db", "world", "realm", "extra"
+    label: str          # Anzeige-Name im Ports/Namen-Bereich
+    default_name: str   # Standard-Containername laut docker-compose.yml
+
+
+@dataclass(frozen=True)
 class ServerProfile:
     key: str
     label: str
@@ -102,17 +118,22 @@ class ServerProfile:
     repo_dirname: str
     image_name: str
     extraction_mode: str          # "cmangos" oder "azerothcore"
-    container_names: tuple
+    container_roles: tuple        # tuple[ContainerRole, ...]
     ports: tuple
     needs_sql_init_unpack: bool
     data_map: tuple               # (Quellordner unter wow-client/, Zielordner unter data/)
     db_core_repo_url: str = ""    # CMaNGOS-Core-Repo (nur für DB-Updates), leer = nicht unterstützt
     db_name: str = ""             # Name der Content-Datenbank in MariaDB
+    console_db_user: str = ""
+    console_db_pass: str = ""
+    console_db_bin: str = "mysql"  # "mariadb" (CMaNGOS) oder "mysql" (AzerothCore-Image mysql:8.0)
+    db_install_repo_url: str = ""  # classic-db.git / tbc-db.git - volle DB-Installation, leer = nicht unterstützt
+    db_install_dirname: str = ""   # "classic-db" / "tbc-db"
+    playerbots_repo_url: str = ""  # gemeinsames Playerbots-Repo, leer = nicht unterstützt
 
 
 DB_USER = "mangos"
 DB_PASS = "mangos"
-DB_CONTAINER = "cmangos-db"
 DB_CORE_SUBDIR = "cmangos-core"
 
 
@@ -122,7 +143,12 @@ PROFILES = {
         repo_url="https://github.com/SchnuBby2205/cmangos-tbc-server.git",
         repo_dirname="cmangos-tbc-server", image_name="cmangos-tbc",
         extraction_mode="cmangos",
-        container_names=("cmangos-db", "cmangos-mangosd", "cmangos-realmd", "koboldcpp"),
+        container_roles=(
+            ContainerRole("db", "Datenbank", "cmangos-db"),
+            ContainerRole("world", "Mangosd (Server-/GM-Konsole)", "cmangos-mangosd"),
+            ContainerRole("realm", "Realmd", "cmangos-realmd"),
+            ContainerRole("extra", "KoboldCPP AI", "koboldcpp"),
+        ),
         ports=(PortDef("Realmd / Login", "3724", "3724"),
                PortDef("Worldserver", "8085", "8085"),
                PortDef("KoboldCPP AI", "5001", "5001")),
@@ -131,13 +157,21 @@ PROFILES = {
                   ("mmaps", "mmaps"), ("cameras", "cameras"), ("buildings", "buildings")),
         db_core_repo_url="https://github.com/cmangos/mangos-tbc.git",
         db_name="tbcmangos",
+        console_db_user="mangos", console_db_pass="mangos", console_db_bin="mariadb",
+        db_install_repo_url="https://github.com/cmangos/tbc-db.git", db_install_dirname="tbc-db",
+        playerbots_repo_url="https://github.com/cmangos/playerbots.git",
     ),
     "classic": ServerProfile(
         key="classic", label="CMaNGOS Classic (1.12)",
         repo_url="https://github.com/SchnuBby2205/cmangos-classic-server.git",
         repo_dirname="cmangos-classic-server", image_name="cmangos-classic",
         extraction_mode="cmangos",
-        container_names=("cmangos-db", "cmangos-mangosd", "cmangos-realmd", "koboldcpp"),
+        container_roles=(
+            ContainerRole("db", "Datenbank", "cmangos-db"),
+            ContainerRole("world", "Mangosd (Server-/GM-Konsole)", "cmangos-mangosd"),
+            ContainerRole("realm", "Realmd", "cmangos-realmd"),
+            ContainerRole("extra", "KoboldCPP AI", "koboldcpp"),
+        ),
         ports=(PortDef("Realmd / Login", "3724", "3724"),
                PortDef("Worldserver", "8085", "8085"),
                PortDef("KoboldCPP AI", "5001", "5001")),
@@ -146,18 +180,29 @@ PROFILES = {
                   ("mmaps", "mmaps"), ("cameras", "cameras"), ("buildings", "buildings")),
         db_core_repo_url="https://github.com/cmangos/mangos-classic.git",
         db_name="classicmangos",
+        console_db_user="mangos", console_db_pass="mangos", console_db_bin="mariadb",
+        db_install_repo_url="https://github.com/cmangos/classic-db.git", db_install_dirname="classic-db",
+        playerbots_repo_url="https://github.com/cmangos/playerbots.git",
     ),
     "azerothcore": ServerProfile(
         key="azerothcore", label="AzerothCore WotLK (3.3.5a)",
         repo_url="https://github.com/SchnuBby2205/azerothcore-wotlk-server.git",
         repo_dirname="azerothcore-wotlk-server", image_name="azerothcore-wotlk",
         extraction_mode="azerothcore",
-        container_names=("ac-database", "ac-worldserver", "ac-authserver"),
+        container_roles=(
+            ContainerRole("db", "Datenbank", "ac-database"),
+            ContainerRole("world", "Worldserver (Server-/GM-Konsole)", "ac-worldserver"),
+            ContainerRole("realm", "Authserver", "ac-authserver"),
+        ),
         ports=(PortDef("Authserver / Login", "3724", "3724"),
                PortDef("Worldserver", "8085", "8085"),
                PortDef("SOAP (optional)", "7878", "7878")),
         needs_sql_init_unpack=False,
         data_map=(("maps", "maps"), ("dbc", "dbc"), ("Cameras", "cameras"), ("vmaps", "vmaps")),
+        # Laut docker-compose.yml: MySQL-Container mit User "root" und Passwort aus
+        # DOCKER_DB_ROOT_PASSWORD (.env), Standardwert "password", falls nicht gesetzt.
+        # Enthält 3 Datenbanken: acore_auth, acore_characters, acore_world.
+        console_db_user="root", console_db_pass="password", console_db_bin="mysql",
         # AzerothCore aktualisiert seine Datenbanken selbst (eigener DB-Updater beim Start) -
         # db_core_repo_url bleibt leer, siehe render_detail()/DB-Updates.
     ),
@@ -206,6 +251,49 @@ def apply_ports_to_compose(project_dir: Path, port_map: dict) -> list:
     return changes
 
 
+def apply_container_names_to_compose(project_dir: Path, name_map: dict) -> list:
+    """Schreibt für jeden {rolle: (aktueller_name, neuer_name)} Eintrag den neuen
+    'container_name:' Wert direkt in die docker-compose.yml. Jeder Containername
+    kommt genau einmal vor, daher reicht ein gezielter Ersatz je Name."""
+    compose_path = project_dir / "docker-compose.yml"
+    text = compose_path.read_text(encoding="utf-8")
+    changes = []
+    for role_key, (old_name, new_name) in name_map.items():
+        if old_name == new_name:
+            continue
+        pattern = re.compile(r'container_name:\s*' + re.escape(old_name) + r'\b')
+        new_text, n = pattern.subn(f"container_name: {new_name}", text, count=1)
+        if n == 0:
+            changes.append(f"[Warnung] container_name '{old_name}' nicht in docker-compose.yml gefunden.")
+        else:
+            text = new_text
+            changes.append(f"{old_name} -> {new_name}")
+    compose_path.write_text(text, encoding="utf-8")
+    return changes
+
+
+def patch_shell_config(path: Path, values: dict) -> list:
+    """Setzt KEY="VALUE"-Zeilen in einer einfachen shell-artigen Config-Datei
+    (wie InstallFullDB.config). Vorhandene KEY=...-Zeilen werden ersetzt,
+    fehlende ans Ende angehängt."""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = text.splitlines()
+    changes = []
+    remaining = dict(values)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        for key in list(remaining):
+            if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
+                lines[i] = f'{key}="{remaining.pop(key)}"'
+                changes.append(f"{key} gesetzt")
+                break
+    for key, val in remaining.items():
+        lines.append(f'{key}="{val}"')
+        changes.append(f"{key} ergänzt (war nicht vorhanden)")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return changes
+
+
 # --------------------------------------------------------------------------
 # Prozess-Runner: führt Kommandos in einem Hintergrundthread aus und
 # streamt stdout/stderr zeilenweise über eine Queue an die GUI. Erlaubt
@@ -217,6 +305,7 @@ class ProcessRunner:
         self._on_line = on_line
         self._on_finished = on_finished
         self._proc = None
+        self._master_fd = None   # gesetzt, solange ein Prozess im PTY-Modus läuft
         self._lock = threading.Lock()
 
     @property
@@ -246,6 +335,7 @@ class ProcessRunner:
 
             with self._lock:
                 self._proc = proc
+                self._master_fd = None
 
             self._on_line(f"$ {' '.join(str(c) for c in cmd)}")
             try:
@@ -262,27 +352,174 @@ class ProcessRunner:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def start_pty(self, cmd, cwd=None):
+        """Wie start(), aber stdin/stdout/stderr hängen an einem echten Pseudo-Terminal.
+        Nötig für 'docker attach' an Container, die mit einem TTY laufen (tty: true in
+        der docker-compose.yml) - Docker lehnt eine reine Pipe dafür ab ('cannot attach
+        stdin to a TTY-enabled container because stdin is not a terminal')."""
+        if self.busy:
+            raise RuntimeError("Es läuft bereits ein Vorgang.")
+        if not HAVE_PTY:
+            self._on_line("[FEHLER] Pseudo-Terminal (pty) ist auf diesem Betriebssystem nicht verfügbar "
+                           "(nur Linux/macOS). 'docker attach' kann hier nicht genutzt werden.")
+            self._on_finished(-1)
+            return
+
+        def worker():
+            master_fd, slave_fd = pty.openpty()
+            # Sofort selbst in den Raw-Modus setzen (kein Zeilenpuffer, kein lokales Echo,
+            # keine Software-Flusskontrolle). Ohne das bleiben Steuerzeichen ohne
+            # abschließendes Enter - wie die Detach-Sequenz Strg+P Strg+Q in terminate() -
+            # im kanonischen Zeilenpuffer des Kernels hängen und kommen nie beim
+            # lesenden Prozess (z.B. 'docker attach') an.
+            try:
+                tty.setraw(slave_fd)
+            except Exception:
+                pass
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=cwd,
+                    stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                    preexec_fn=os.setsid, close_fds=True,
+                )
+            except Exception as exc:
+                os.close(master_fd)
+                os.close(slave_fd)
+                self._on_line(f"[FEHLER] Konnte Prozess nicht starten: {exc}")
+                self._on_finished(-1)
+                return
+
+            os.close(slave_fd)  # gehört jetzt dem Kindprozess, hier nicht mehr benötigt
+
+            with self._lock:
+                self._proc = proc
+                self._master_fd = master_fd
+
+            self._on_line(f"$ {' '.join(str(c) for c in cmd)}")
+            buf = b""
+            try:
+                while True:
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        ready, _, _ = select.select([master_fd], [], [], 0.2)
+                    except (OSError, ValueError):
+                        break
+                    if master_fd not in ready:
+                        continue
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        self._on_line(line.decode("utf-8", errors="replace").rstrip("\r"))
+            finally:
+                if buf:
+                    self._on_line(buf.decode("utf-8", errors="replace"))
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+
+            rc = proc.wait()
+            with self._lock:
+                self._proc = None
+                self._master_fd = None
+            self._on_line(f"[Beendet mit Exit-Code {rc}]")
+            self._on_finished(rc)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def send_input(self, text: str):
         with self._lock:
             proc = self._proc
+            master_fd = self._master_fd
         if proc is None or proc.poll() is not None:
             self._on_line("[Hinweis] Kein laufender Prozess, an den Eingaben gesendet werden können.")
             return
         try:
-            proc.stdin.write(text + "\n")
-            proc.stdin.flush()
+            if master_fd is not None:
+                os.write(master_fd, (text + "\n").encode("utf-8"))
+            else:
+                proc.stdin.write(text + "\n")
+                proc.stdin.flush()
             self._on_line(f"> {text}")
         except Exception as exc:
             self._on_line(f"[FEHLER beim Senden der Eingabe] {exc}")
 
     def terminate(self):
+        """Beendet den laufenden Vorgang sauber. Läuft gerade eine PTY-Sitzung (z.B.
+        'docker attach', siehe start_pty()), wird die von Docker vorgesehene
+        Detach-Tastenkombination Strg+P Strg+Q gesendet - das trennt nur die lokale
+        Sitzung und lässt den Container/Server unangetastet weiterlaufen. Reagiert der
+        Prozess darauf nicht, wird nach kurzer Zeit auf ein Signal eskaliert.
+        Bei normalen Prozessen wird direkt SIGINT (entspricht Strg+C) gesendet und bei
+        Bedarf auf SIGTERM/SIGKILL eskaliert - viele Prozesse (u.a. 'docker compose
+        logs -f', interaktive Extraktions-Skripte) reagieren nur auf ein echtes
+        Strg+C-Signal sauber und beenden sich nicht bei SIGTERM allein."""
         with self._lock:
             proc = self._proc
-        if proc is not None and proc.poll() is None:
+            master_fd = self._master_fd
+        if proc is None or proc.poll() is not None:
+            return
+
+        if master_fd is not None:
             try:
-                proc.terminate()
+                os.write(master_fd, b"\x10\x11")  # Strg+P, Strg+Q
             except Exception:
                 pass
+
+            def escalate_after_detach():
+                time.sleep(2)
+                with self._lock:
+                    p = self._proc
+                if p is None or p.poll() is not None:
+                    return
+                try:
+                    p.send_signal(signal.SIGINT)
+                except Exception:
+                    pass
+                time.sleep(2)
+                with self._lock:
+                    p2 = self._proc
+                if p2 is not None and p2.poll() is None:
+                    try:
+                        p2.terminate()
+                    except Exception:
+                        pass
+
+            threading.Thread(target=escalate_after_detach, daemon=True).start()
+            return
+
+        try:
+            proc.send_signal(signal.SIGINT)
+        except Exception:
+            pass
+
+        def escalate():
+            time.sleep(3)
+            with self._lock:
+                p = self._proc
+            if p is None or p.poll() is not None:
+                return
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            time.sleep(2)
+            with self._lock:
+                p = self._proc
+            if p is not None and p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+        threading.Thread(target=escalate, daemon=True).start()
 
 
 # --------------------------------------------------------------------------
@@ -357,6 +594,8 @@ def dark_check(master, text, variable, **kw):
 # Hauptanwendung
 # --------------------------------------------------------------------------
 
+#DB-Installation vorerst auskommentiert
+#CATEGORIES = ("Setup", "Extraktion", "Ports", "DB-Installation", "DB-Updates", "Server")
 CATEGORIES = ("Setup", "Extraktion", "Ports", "DB-Updates", "Server")
 
 
@@ -372,10 +611,13 @@ class App:
         self.cmangos_threads_var = tk.StringVar(value="")
         self.ac_quick_mmaps_var = tk.BooleanVar(value=True)
         self.port_vars: dict = {}
+        self.console_vars: dict = {}
+        self._console_vars_profile = None
 
         self.runner = ProcessRunner(self._on_line, self._on_finished)
         self._log_queue: "queue.Queue" = queue.Queue()
         self._chain: list = []
+        self._ui_busy = False
         self.active_category = 0
         self.side_buttons = []
         self.cards: list = []
@@ -388,8 +630,21 @@ class App:
 
         self._build_header()
         self._build_warning()
-        self._build_body()
-        self._build_footer()
+
+        # Vertikal verschiebbarer Trenner zwischen Navigation/Karten (oben) und
+        # Fortschritt/Protokoll (unten) - per Maus ziehbar, damit z.B. das Protokoll
+        # bei Bedarf größer gezogen werden kann.
+        self.paned = tk.PanedWindow(self.root, orient=tk.VERTICAL, sashwidth=6,
+                                     sashrelief="raised", bg=T.LINE, bd=0,
+                                     showhandle=False, opaqueresize=True)
+        self.paned.pack(side="top", fill="both", expand=True)
+        body_frame = tk.Frame(self.paned, bg=T.BG)
+        foot_frame = tk.Frame(self.paned, bg=T.BG)
+        self.paned.add(body_frame, stretch="always", minsize=220)
+        self.paned.add(foot_frame, stretch="always", minsize=140)
+
+        self._build_body(body_frame)
+        self._build_footer(foot_frame)
 
         self.select_category(0)
         self.root.after(100, self._pump)
@@ -414,8 +669,8 @@ class App:
             bg=T.BG, fg=T.YELLOW, font=FONT_SMALL, wraplength=1040, justify="left", anchor="w",
         ).pack(fill="x", padx=18, pady=(8, 4))
 
-    def _build_body(self):
-        body = tk.Frame(self.root, bg=T.BG)
+    def _build_body(self, parent):
+        body = tk.Frame(parent, bg=T.BG)
         body.pack(side="top", fill="both", expand=True)
 
         # linke Spalte
@@ -470,8 +725,44 @@ class App:
         self.options_area = tk.Frame(detail, bg=T.PANEL)
         self.options_area.pack(fill="x", padx=16, pady=(10, 0))
 
-        self.item_area = tk.Frame(detail, bg=T.PANEL)
-        self.item_area.pack(fill="both", expand=True, padx=16, pady=10)
+        item_container = tk.Frame(detail, bg=T.PANEL)
+        item_container.pack(fill="both", expand=True, padx=16, pady=10)
+
+        item_canvas = tk.Canvas(item_container, bg=T.PANEL, highlightthickness=0, bd=0)
+        item_scroll = ttk.Scrollbar(item_container, orient="vertical", command=item_canvas.yview)
+        item_canvas.configure(yscrollcommand=item_scroll.set)
+        item_canvas.pack(side="left", fill="both", expand=True)
+        item_scroll.pack(side="right", fill="y")
+
+        self.item_area = tk.Frame(item_canvas, bg=T.PANEL)
+        item_window = item_canvas.create_window((0, 0), window=self.item_area, anchor="nw")
+
+        def _on_item_area_configure(_event):
+            item_canvas.configure(scrollregion=item_canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            item_canvas.itemconfig(item_window, width=event.width)
+
+        self.item_area.bind("<Configure>", _on_item_area_configure)
+        item_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _wheel(event):
+            delta = event.delta
+            if delta:
+                item_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+        def _bind_wheel(_e):
+            item_canvas.bind_all("<MouseWheel>", _wheel)
+            item_canvas.bind_all("<Button-4>", lambda e: item_canvas.yview_scroll(-3, "units"))
+            item_canvas.bind_all("<Button-5>", lambda e: item_canvas.yview_scroll(3, "units"))
+
+        def _unbind_wheel(_e):
+            item_canvas.unbind_all("<MouseWheel>")
+            item_canvas.unbind_all("<Button-4>")
+            item_canvas.unbind_all("<Button-5>")
+
+        item_canvas.bind("<Enter>", _bind_wheel)
+        item_canvas.bind("<Leave>", _unbind_wheel)
 
     def _add_side_button(self, parent, index, name):
         row = tk.Frame(parent, bg=T.SIDEBAR, cursor="hand2")
@@ -484,10 +775,10 @@ class App:
             widget.bind("<Button-1>", lambda _e, i=index: self.select_category(i))
         self.side_buttons.append((row, marker, text))
 
-    def _build_footer(self):
-        tk.Frame(self.root, bg=T.LINE, height=1).pack(side="top", fill="x")
-        foot = tk.Frame(self.root, bg=T.BG)
-        foot.pack(side="top", fill="x")
+    def _build_footer(self, parent):
+        tk.Frame(parent, bg=T.LINE, height=1).pack(side="top", fill="x")
+        foot = tk.Frame(parent, bg=T.BG)
+        foot.pack(side="top", fill="both", expand=True)
 
         box = tk.Frame(foot, bg=T.PANEL, highlightthickness=1, highlightbackground=T.LINE)
         box.pack(fill="x", padx=14, pady=(12, 8))
@@ -512,8 +803,20 @@ class App:
         self.cancel_btn = dark_button(bottom, "Abbrechen", self.action_terminate, danger=True, state="disabled")
         self.cancel_btn.pack(side="right")
 
+        console = tk.Frame(foot, bg=T.BG)
+        console.pack(side="bottom", fill="x", padx=14, pady=(0, 12))
+        tk.Label(console, text="Eingabe an laufenden Prozess:", bg=T.BG, fg=T.DIM, font=FONT_SMALL).pack(side="left")
+        self.console_var = tk.StringVar()
+        self.console_entry = dark_entry(console, textvariable=self.console_var)
+        self.console_entry.pack(side="left", fill="x", expand=True, padx=6)
+        self.console_entry.bind("<Return>", lambda e: self._send_console_input())
+        dark_button(console, "Senden", self._send_console_input).pack(side="left")
+        dark_button(console, "⏎ Enter", lambda: self.runner.send_input("")).pack(side="left", padx=(6, 0))
+        dark_button(console, "y", lambda: self.runner.send_input("y")).pack(side="left", padx=2)
+        dark_button(console, "n", lambda: self.runner.send_input("n")).pack(side="left", padx=2)
+
         logbox = tk.Frame(foot, bg=T.BG)
-        logbox.pack(fill="both", padx=14, pady=(0, 6))
+        logbox.pack(side="top", fill="both", expand=True, padx=14, pady=(0, 6))
         self.log = tk.Text(logbox, height=10, bg="#14171d", fg=T.DIM, font=FONT_MONO, relief="flat",
                             wrap="word", insertbackground=T.FG, state="disabled",
                             highlightthickness=1, highlightbackground=T.LINE)
@@ -525,18 +828,6 @@ class App:
         self.log.tag_configure("ok", foreground=T.GREEN)
         self.log.tag_configure("warn", foreground=T.YELLOW)
         self.log.tag_configure("err", foreground=T.RED)
-
-        console = tk.Frame(foot, bg=T.BG)
-        console.pack(fill="x", padx=14, pady=(0, 12))
-        tk.Label(console, text="Eingabe an laufenden Prozess:", bg=T.BG, fg=T.DIM, font=FONT_SMALL).pack(side="left")
-        self.console_var = tk.StringVar()
-        self.console_entry = dark_entry(console, textvariable=self.console_var)
-        self.console_entry.pack(side="left", fill="x", expand=True, padx=6)
-        self.console_entry.bind("<Return>", lambda e: self._send_console_input())
-        dark_button(console, "Senden", self._send_console_input).pack(side="left")
-        dark_button(console, "⏎ Enter", lambda: self.runner.send_input("")).pack(side="left", padx=(6, 0))
-        dark_button(console, "y", lambda: self.runner.send_input("y")).pack(side="left", padx=2)
-        dark_button(console, "n", lambda: self.runner.send_input("n")).pack(side="left", padx=2)
 
     # -- Kategorien / Karten ------------------------------------------------
 
@@ -555,7 +846,8 @@ class App:
         descriptions = {
             "Setup": "Repository holen, sql-init entpacken, Docker-Image bauen.",
             "Extraktion": "WoW-Daten (Maps/VMaps/MMaps/DBC) aus dem Client extrahieren.",
-            "Ports": "Host-Ports dieses Servers anpassen (wird in die docker-compose.yml geschrieben).",
+            "Ports": "Host-Ports und Container-Namen dieses Servers anpassen (wird in die docker-compose.yml geschrieben).",
+            "DB-Installation": "Datenbank komplett neu installieren/befüllen (classic-db/tbc-db + mangos-Core + Playerbots).",
             "DB-Updates": "CMaNGOS-Core-Repo klonen und fehlende SQL-Updates in die laufende Datenbank einspielen.",
             "Server": "Server starten, stoppen, Status und Logs ansehen.",
         }
@@ -626,16 +918,33 @@ class App:
         elif name == "Ports":
             self._render_ports_panel()
 
+        elif name == "DB-Installation":
+            self._render_db_install_panel()
+
         elif name == "DB-Updates":
             self._render_db_updates_panel()
 
         elif name == "Server":
+            self._ensure_console_vars(profile)
+            row = tk.Frame(self.options_area, bg=T.PANEL)
+            row.pack(fill="x", pady=(0, 8))
+            for key, label, width in (("container", "DB-Container", 12), ("user", "DB-User", 10),
+                                       ("password", "DB-Passwort", 10), ("bin", "DB-Client", 8)):
+                cell = tk.Frame(row, bg=T.PANEL)
+                cell.pack(side="left", padx=(0, 14))
+                tk.Label(cell, text=label, bg=T.PANEL, fg=T.DIM, font=FONT_SMALL).pack(anchor="w")
+                dark_entry(cell, textvariable=self.console_vars[key], width=width).pack(anchor="w")
+
             entries = [
                 ("Nur Datenbank starten", "docker compose up <db-service> -d", self.action_start_db),
                 ("Server starten (komplett)", "docker compose up -d", self.action_start_all),
                 ("Server stoppen", "docker compose down", self.action_stop),
                 ("Status anzeigen", "docker compose ps", self.action_status),
-                ("Logs (Worldserver) live", "docker compose logs -f", self.action_logs_worldserver),
+                ("Logs (Worldserver) live", "docker compose logs -f (mit 'Abbrechen' beenden)", self.action_logs_worldserver),
+                ("DB-Konsole öffnen", "Interaktive SQL-Konsole im Datenbank-Container (Accounts/Charaktere per SQL bearbeiten)",
+                 self.action_db_console),
+                ("Server-Konsole (docker attach)", f"Live-Konsole von '{self._container_name(profile, 'world')}' — "
+                 "GM-/Account-Befehle eingeben (z.B. 'account create name pass email')", self.action_world_console),
             ]
             self._render_cards(entries)
 
@@ -680,6 +989,118 @@ class App:
         )
         hint.pack(fill="x", pady=(4, 0))
 
+        # --- Container-Namen ---
+        tk.Frame(self.item_area, bg=T.LINE, height=1).pack(fill="x", padx=6, pady=(16, 12))
+        tk.Label(self.item_area, text="Container-Namen", bg=T.PANEL, fg=T.FG,
+                 font=FONT_BOLD, anchor="w").pack(fill="x", padx=6)
+
+        names_panel = tk.Frame(self.item_area, bg=T.PANEL)
+        names_panel.pack(fill="x", pady=(6, 4), padx=6)
+
+        saved_names = self.cfg.get("containers", {}).get(profile.key, {})
+        self.container_name_vars = {}
+        for role in profile.container_roles:
+            row = tk.Frame(names_panel, bg=T.CARD, highlightthickness=1, highlightbackground=T.LINE)
+            row.pack(fill="x", pady=4)
+            tk.Label(row, text=role.label, bg=T.CARD, fg=T.FG, font=FONT_BOLD,
+                     anchor="w", width=26).pack(side="left", padx=(12, 4), pady=10)
+            tk.Label(row, text=f"Standard: {role.default_name}", bg=T.CARD, fg=T.DIM,
+                     font=FONT_SMALL, anchor="w").pack(side="left", padx=4)
+            value = saved_names.get(role.key, role.default_name)
+            var = tk.StringVar(value=value)
+            dark_entry(row, textvariable=var, width=24).pack(side="right", padx=12, pady=10)
+            tk.Label(row, text="Name:", bg=T.CARD, fg=T.DIM, font=FONT_SMALL).pack(side="right")
+            self.container_name_vars[role.key] = var
+
+        dark_button(names_panel, "Container-Namen in docker-compose.yml übernehmen",
+                    self.action_apply_container_names).pack(anchor="w", pady=(10, 4))
+
+        hint2 = tk.Label(
+            names_panel,
+            text=("Ändert 'container_name:' direkt in der docker-compose.yml. Bereits laufende Container "
+                  "behalten ihren alten Namen, bis der Server neu erstellt wird ('Server stoppen' + "
+                  "'Server starten'). CMaNGOS TBC und Classic verwenden standardmäßig identische Namen — "
+                  "hier eindeutige Namen vergeben, um beide gleichzeitig zu betreiben (zusammen mit "
+                  "eindeutigen Ports oben)."),
+            bg=T.PANEL, fg=T.DIM, font=FONT_SMALL, wraplength=760, justify="left", anchor="w",
+        )
+        hint2.pack(fill="x", pady=(4, 0))
+
+    def _ensure_db_install_vars(self, profile: ServerProfile):
+        if getattr(self, "_db_install_vars_profile", None) == profile.key and getattr(self, "db_install_vars", None):
+            return
+        saved = self.cfg.get("db_install", {}).get(profile.key, {})
+        self.db_install_vars = {
+            "root_user": tk.StringVar(value=saved.get("root_user", "root")),
+            "root_pass": tk.StringVar(value=saved.get("root_pass", "root")),
+        }
+        self._db_install_vars_profile = profile.key
+
+    def _render_db_install_panel(self):
+        profile = self.current_profile()
+
+        if not profile.db_install_repo_url:
+            tk.Label(
+                self.item_area,
+                text=(f"{profile.label} nutzt hierfür einen eigenen DB-Import beim Start — hier ist keine "
+                      "Aktion nötig."),
+                bg=T.PANEL, fg=T.DIM, font=FONT, wraplength=760, justify="left", anchor="w",
+            ).pack(fill="x", pady=8, padx=6)
+            return
+
+        self._ensure_db_install_vars(profile)
+        db_container = self._container_name(profile, "db")
+        characters_db = f"{profile.key}characters"
+        realmd_db = f"{profile.key}realmd"
+        logs_db = f"{profile.key}logs"
+
+        panel = tk.Frame(self.item_area, bg=T.PANEL)
+        panel.pack(fill="x", pady=4, padx=6)
+
+        info = tk.Label(
+            panel,
+            text=(f"DB-Repo: {profile.db_install_repo_url}   |   Core-Repo: {profile.db_core_repo_url}   |   "
+                  f"Playerbots: {profile.playerbots_repo_url}\n"
+                  f"Datenbanken: {profile.db_name} (World), {characters_db}, {realmd_db}, {logs_db}   "
+                  f"(Container {db_container}, Nutzer {DB_USER})"),
+            bg=T.PANEL, fg=T.DIM, font=FONT_SMALL, justify="left", anchor="w",
+        )
+        info.pack(fill="x", pady=(0, 8))
+
+        root_row = tk.Frame(panel, bg=T.PANEL)
+        root_row.pack(fill="x", pady=(0, 10))
+        tk.Label(root_row, text="Root-User (für GRANT):", bg=T.PANEL, fg=T.FG, font=FONT_SMALL).pack(side="left")
+        dark_entry(root_row, textvariable=self.db_install_vars["root_user"], width=10).pack(side="left", padx=(4, 14))
+        tk.Label(root_row, text="Root-Passwort:", bg=T.PANEL, fg=T.FG, font=FONT_SMALL).pack(side="left")
+        dark_entry(root_row, textvariable=self.db_install_vars["root_pass"], width=10).pack(side="left", padx=4)
+
+        entries = [
+            ("1) Datenbank starten", "docker compose up db -d", self.action_start_db),
+            ("2) Repos klonen", f"{profile.db_install_dirname} + mangos-Core (cmangos-core/) + playerbots klonen/aktualisieren",
+             self.action_db_install_clone),
+            ("3) InstallFullDB.config anpassen", f"MYSQL_HOST/USERNAME/PASSWORD/USERIP/PATH/CORE_PATH in "
+             f"{profile.db_install_dirname}/InstallFullDB.config setzen",
+             self.action_db_install_configure),
+            ("Root-Passwort suchen", "MYSQL_ROOT_PASSWORD/MARIADB_ROOT_PASSWORD aus docker-compose.yml/.env "
+             "auflösen und oben automatisch eintragen (falls 'DB-User Rechte vergeben' mit Access denied fehlschlägt)",
+             self.action_db_install_find_root_pass),
+            ("4) DB-User Rechte vergeben", "GRANT ALL PRIVILEGES für 'mangos'@'%' (per Root-Zugang oben)",
+             self.action_db_install_grant),
+            ("5) Hauptdatenbank installieren", "InstallFullDB.sh interaktiv ausführen — Eingaben unten im "
+             "Konsolenfeld tätigen (z.B. 4, 1, DeleteAll). ACHTUNG: kann bestehende Daten löschen!",
+             self.action_db_install_run),
+            ("6) DB-Updates einspielen (Core-Fallback)", f"Nur falls Schritt 5 bei Option 3 mit Fehler abbricht: "
+             f"characters/realmd/logs Basis-Schema + Updates aus dem Core-Repo manuell einspielen",
+             self.action_db_install_core_updates),
+            ("7) Playerbots-Tabellen einspielen", "Playerbots-SQL für characters- und world-Datenbank importieren "
+             "(Pflicht für Random-Bots/AddAItem)",
+             self.action_db_install_playerbots),
+            ("Tabellen prüfen", f"SHOW TABLES LIKE 'ai_playerbot%' in {characters_db} (sollte ~10 Tabellen zeigen)",
+             self.action_db_install_verify),
+            ("8) Alles starten", "docker compose up -d", self.action_start_all),
+        ]
+        self._render_cards(entries)
+
     def _render_db_updates_panel(self):
         profile = self.current_profile()
 
@@ -693,8 +1114,8 @@ class App:
             return
 
         saved = self.cfg.get("db_update_range", {}).get(profile.key, {})
-        default_from = "2831" if profile.key == "classic" else ""
-        default_to = "2837" if profile.key == "classic" else ""
+        default_from = "z2831" if profile.key == "classic" else ""
+        default_to = "z2837" if profile.key == "classic" else ""
 
         panel = tk.Frame(self.item_area, bg=T.PANEL)
         panel.pack(fill="x", pady=4, padx=6)
@@ -702,33 +1123,56 @@ class App:
         info = tk.Label(
             panel,
             text=(f"Core-Repo: {profile.db_core_repo_url}\n"
-                  f"Datenbank: {profile.db_name}  (Container {DB_CONTAINER}, Nutzer {DB_USER})"),
+                  f"Datenbank: {profile.db_name}  (Container {self._container_name(profile, 'db')}, Nutzer {DB_USER})"),
             bg=T.PANEL, fg=T.DIM, font=FONT_SMALL, justify="left", anchor="w",
         )
         info.pack(fill="x", pady=(0, 8))
 
         range_row = tk.Frame(panel, bg=T.PANEL)
         range_row.pack(fill="x", pady=(0, 10))
-        tk.Label(range_row, text="SQL-Updates von z", bg=T.PANEL, fg=T.FG, font=FONT_SMALL).pack(side="left")
+        tk.Label(range_row, text="SQL-Updates von", bg=T.PANEL, fg=T.FG, font=FONT_SMALL).pack(side="left")
         self.db_from_var = tk.StringVar(value=saved.get("from", default_from))
         dark_entry(range_row, textvariable=self.db_from_var, width=8).pack(side="left", padx=4)
-        tk.Label(range_row, text="bis z", bg=T.PANEL, fg=T.FG, font=FONT_SMALL).pack(side="left", padx=(10, 0))
+        tk.Label(range_row, text="bis", bg=T.PANEL, fg=T.FG, font=FONT_SMALL).pack(side="left", padx=(10, 0))
         self.db_to_var = tk.StringVar(value=saved.get("to", default_to))
         dark_entry(range_row, textvariable=self.db_to_var, width=8).pack(side="left", padx=4)
-        tk.Label(range_row, text="(z.B. 2831 bis 2837 -> prüft alle z2831_*.sql ... z2837_*.sql im Core-Repo)",
+        tk.Label(range_row, text="(Buchstabe(n) + Nummer, z.B. z2831 bis z2837 oder s2000 bis s2010 — "
+                 "TBC nutzt sowohl 's' als auch 'z'; bei Bedarf beide Präfixe nacheinander einspielen)",
                  bg=T.PANEL, fg=T.DIM, font=FONT_SMALL).pack(side="left", padx=(10, 0))
 
         entries = [
             ("Core-Repo klonen / aktualisieren", f"git clone/pull von {profile.db_core_repo_url} nach cmangos-core/",
              self.action_db_clone_core),
-            ("SQL-Updates einspielen", f"Passende z<Version>_*.sql aus sql/updates/mangos/ nacheinander in "
-             f"'{profile.db_name}' einspielen (bricht bei erstem Fehler ab)",
+            ("SQL-Updates einspielen", f"Passende <Präfix><Version>_*.sql (z.B. z2831_*.sql oder s2000_*.sql) aus "
+             f"sql/updates/mangos/ nacheinander in '{profile.db_name}' einspielen (bricht bei erstem Fehler ab)",
              self.action_db_apply_updates),
         ]
         self._render_cards(entries)
 
+    def _current_container_names(self, profile: ServerProfile) -> dict:
+        """Aktuelle (ggf. vom Nutzer angepasste) Containernamen für ein Profil,
+        role_key -> Name. Fällt auf die Compose-Standardnamen zurück."""
+        saved = self.cfg.get("containers", {}).get(profile.key, {})
+        return {role.key: saved.get(role.key, role.default_name) for role in profile.container_roles}
+
+    def _container_name(self, profile: ServerProfile, role_key: str) -> str:
+        return self._current_container_names(profile).get(role_key, "")
+
+    def _ensure_console_vars(self, profile: ServerProfile):
+        if self._console_vars_profile == profile.key and self.console_vars:
+            return
+        saved = self.cfg.get("console", {}).get(profile.key, {})
+        defaults = {
+            "container": self._container_name(profile, "db"),
+            "user": profile.console_db_user,
+            "password": profile.console_db_pass,
+            "bin": profile.console_db_bin,
+        }
+        self.console_vars = {k: tk.StringVar(value=saved.get(k, v)) for k, v in defaults.items()}
+        self._console_vars_profile = profile.key
+
     def _refresh_busy_state(self):
-        busy = self.runner.busy
+        busy = self._ui_busy
         self.busy_label.configure(text="Vorgang läuft …" if busy else "")
         self.cancel_btn.configure(state="normal" if busy else "disabled")
         for card in self.cards:
@@ -822,6 +1266,7 @@ class App:
         self.log.configure(state="disabled")
 
     def _start_progress(self, title: str):
+        self._ui_busy = True
         self.prog_title.configure(text=title, fg=T.FG)
         self.prog_status.configure(text="")
         self.prog_bar.configure(mode="indeterminate")
@@ -829,6 +1274,7 @@ class App:
         self._refresh_busy_state()
 
     def _finish_progress(self, rc: int):
+        self._ui_busy = False
         self.prog_bar.stop()
         self.prog_bar.configure(mode="determinate")
         self.prog_var.set(100.0)
@@ -849,6 +1295,12 @@ class App:
             self._append_log(f"--- {title} ---")
             self._start_progress(title)
         self.runner.start(cmd, cwd=cwd)
+
+    def _run_pty(self, cmd, cwd=None, title=None):
+        if title:
+            self._append_log(f"--- {title} ---")
+            self._start_progress(title)
+        self.runner.start_pty(cmd, cwd=cwd)
 
     def _run_chain(self, steps):
         self._chain = list(steps)
@@ -884,7 +1336,7 @@ class App:
     # -- Vorbedingungen ----------------------------------------------------
 
     def _guard_busy(self) -> bool:
-        if self.runner.busy:
+        if self._ui_busy or self.runner.busy:
             messagebox.showwarning("Beschäftigt", "Es läuft bereits ein Vorgang. Bitte warten oder stoppen.",
                                     parent=self.root)
             return True
@@ -976,7 +1428,353 @@ class App:
             "docker-compose.yml macht das rückgängig). Server ggf. neu starten."
         )
 
+    def action_apply_container_names(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir() or not self._require_compose_file():
+            return
+        profile = self.current_profile()
+        current = self._current_container_names(profile)
+
+        name_re = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+        name_map = {}
+        seen = {}
+        for role in profile.container_roles:
+            new_name = self.container_name_vars[role.key].get().strip()
+            if not new_name:
+                messagebox.showerror("Ungültiger Name", f"Der Container-Name für '{role.label}' darf nicht leer sein.",
+                                      parent=self.root)
+                return
+            if not name_re.match(new_name):
+                messagebox.showerror("Ungültiger Name",
+                                      f"'{new_name}' ist kein gültiger Docker-Container-Name (erlaubt: Buchstaben, "
+                                      "Ziffern, '_', '.', '-', darf nicht mit Sonderzeichen beginnen).",
+                                      parent=self.root)
+                return
+            if new_name in seen:
+                messagebox.showerror("Doppelter Name", f"Der Container-Name '{new_name}' ist mehrfach vergeben.",
+                                      parent=self.root)
+                return
+            seen[new_name] = role.key
+            name_map[role.key] = (current.get(role.key, role.default_name), new_name)
+
+        self._clear_log()
+        self._append_log(f"--- {profile.label}: Container-Namen übernehmen ---")
+        try:
+            changes = apply_container_names_to_compose(self.project_dir(), name_map)
+        except Exception as exc:
+            self._append_log(f"[FEHLER] Konnte docker-compose.yml nicht anpassen: {exc}")
+            return
+
+        for c in changes or ["Keine Änderungen — Namen entsprachen bereits den eingetragenen Werten."]:
+            self._append_log(c)
+
+        self.cfg.setdefault("containers", {})[profile.key] = {role_key: new for role_key, (_, new) in name_map.items()}
+        save_config(self.cfg)
+        # Erzwingt beim nächsten Öffnen von 'Server' einen Neuaufbau der DB-Konsolen-Felder
+        # mit dem jetzt aktuellen Container-Namen.
+        self._console_vars_profile = None
+        self._append_log(
+            "[Hinweis] docker-compose.yml wurde direkt im Projektordner geändert (git checkout -- "
+            "docker-compose.yml macht das rückgängig). Für bereits laufende Container: 'Server stoppen' und "
+            "danach neu starten, damit die neuen Namen greifen."
+        )
+
     # -- Aktionen: DB-Updates (Core-Repo + fehlende SQL-Updates einspielen) ----
+
+    def action_db_install_clone(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir():
+            return
+        if not self._tool_available("git"):
+            messagebox.showerror("git fehlt", "git wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        if not profile.db_install_repo_url:
+            return
+        project = self.project_dir()
+
+        def clone_or_skip(repo_url: str, dirname: str) -> str:
+            d = shlex.quote(dirname)
+            u = shlex.quote(repo_url)
+            return (
+                f'if [ -d {d}/.git ]; then echo "{dirname}: bereits vorhanden, klonen übersprungen."; '
+                f'else echo "Klone {repo_url} nach {dirname} ..."; git clone {u} {d} || exit 1; fi'
+            )
+
+        script = "set -u\n" + "\n".join([
+            clone_or_skip(profile.db_install_repo_url, profile.db_install_dirname),
+            clone_or_skip(profile.db_core_repo_url, DB_CORE_SUBDIR),
+            clone_or_skip(profile.playerbots_repo_url, "playerbots"),
+        ])
+        self._clear_log()
+        self._run(["bash", "-c", script], cwd=str(project), title=f"{profile.label}: DB-Repos klonen")
+
+    def action_db_install_configure(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir():
+            return
+        profile = self.current_profile()
+        if not profile.db_install_repo_url:
+            return
+        config_path = self.project_dir() / profile.db_install_dirname / "InstallFullDB.config"
+        if not config_path.exists():
+            messagebox.showerror("Fehlt", f"{config_path} nicht gefunden. Zuerst Schritt 2 (Repos klonen) "
+                                           "ausführen.", parent=self.root)
+            return
+
+        values = {
+            "MYSQL_HOST": "db",   # Compose-Servicename - im Projekt-Netzwerk immer erreichbar,
+                                  # unabhängig von einem ggf. individuell vergebenen Container-Namen.
+            "MYSQL_USERNAME": DB_USER,
+            "MYSQL_PASSWORD": DB_PASS,
+            "MYSQL_USERIP": "%",
+            "MYSQL_PATH": "/usr/bin/mariadb",
+            "MYSQL_DUMP_PATH": "/usr/bin/mariadb-dump",
+            "CORE_PATH": "/work/mangos-src",
+        }
+        self._clear_log()
+        self._append_log(f"--- {profile.label}: InstallFullDB.config anpassen ---")
+        try:
+            changes = patch_shell_config(config_path, values)
+        except Exception as exc:
+            self._append_log(f"[FEHLER] {exc}")
+            return
+        for c in changes:
+            self._append_log(c)
+        self._append_log(f"Fertig: {config_path}")
+
+    def action_db_install_find_root_pass(self):
+        if not self._require_project_dir() or not self._require_compose_file():
+            return
+        profile = self.current_profile()
+        self._ensure_db_install_vars(profile)
+
+        compose_text = (self.project_dir() / "docker-compose.yml").read_text(encoding="utf-8")
+        m = re.search(r'(MYSQL_ROOT_PASSWORD|MARIADB_ROOT_PASSWORD)\s*[:=]?\s*["\']?([^"\'\n#]+)', compose_text)
+
+        self._clear_log()
+        self._append_log(f"--- {profile.label}: Root-Passwort suchen ---")
+        if not m:
+            self._append_log(
+                "Keine MYSQL_ROOT_PASSWORD/MARIADB_ROOT_PASSWORD-Zeile in der docker-compose.yml gefunden. "
+                "Entweder ist kein Root-Passwort gesetzt (dann evtl. leeres Passwort probieren), oder es "
+                "steht unter anderem Namen in einer .env-Datei - dort bitte manuell nachsehen."
+            )
+            return
+
+        raw_value = m.group(2).strip()
+        value = raw_value
+        var_match = re.match(r'^\$\{([A-Za-z_][A-Za-z0-9_]*)(:-(.*))?\}$', raw_value)
+        if var_match:
+            var_name, default_val = var_match.group(1), var_match.group(3)
+            env_path = self.project_dir() / ".env"
+            found = None
+            if env_path.exists():
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith(f"{var_name}="):
+                        found = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+            if found is not None:
+                value = found
+                self._append_log(f"Variable {var_name} aus .env aufgelöst.")
+            elif default_val is not None:
+                value = default_val
+                self._append_log(f"Variable {var_name} nicht in .env gefunden — Vorgabewert aus "
+                                  "docker-compose.yml verwendet.")
+            else:
+                self._append_log(f"[Warnung] Variable {var_name} referenziert, aber weder in .env noch als "
+                                  "Vorgabewert gefunden — bitte manuell in .env/Umgebung nachsehen.")
+                return
+
+        self._append_log(f"Root-Passwort gefunden: {value}")
+        self.db_install_vars["root_user"].set("root")
+        self.db_install_vars["root_pass"].set(value)
+        self._append_log("Root-User/-Passwort-Felder oben wurden automatisch ausgefüllt.")
+
+    def action_db_install_grant(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir():
+            return
+        if not self._tool_available("docker"):
+            messagebox.showerror("docker fehlt", "docker wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        if not profile.db_install_repo_url:
+            return
+        self._ensure_db_install_vars(profile)
+        root_user = self.db_install_vars["root_user"].get().strip() or "root"
+        root_pass = self.db_install_vars["root_pass"].get()
+
+        self.cfg.setdefault("db_install", {})[profile.key] = {"root_user": root_user, "root_pass": root_pass}
+        save_config(self.cfg)
+
+        db_container = self._container_name(profile, "db")
+        sql = "GRANT ALL PRIVILEGES ON *.* TO 'mangos'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+        cmd = ["docker", "exec", db_container, "mariadb", f"-u{root_user}", f"-p{root_pass}", "-e", sql]
+        self._clear_log()
+        self._run(cmd, title=f"{profile.label}: DB-User Rechte vergeben")
+
+    def action_db_install_run(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir() or not self._require_compose_file():
+            return
+        if not self._tool_available("docker"):
+            messagebox.showerror("docker fehlt", "docker wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        if not profile.db_install_repo_url:
+            return
+        project = self.project_dir()
+        db_dir = project / profile.db_install_dirname
+        core_dir = project / DB_CORE_SUBDIR
+        if not db_dir.exists() or not core_dir.exists():
+            messagebox.showerror("Fehlt", "Bitte zuerst Schritt 2 (Repos klonen) und Schritt 3 (Config anpassen) "
+                                           "ausführen.", parent=self.root)
+            return
+
+        if not messagebox.askyesno(
+            "Achtung — Datenbank wird (neu) installiert",
+            f"Startet InstallFullDB.sh für {profile.label} interaktiv. Im Menü unten im Eingabefeld "
+            "nacheinander eingeben und jeweils mit Enter/Senden bestätigen:\n\n"
+            "  4\n  1\n  DeleteAll\n\n"
+            "('DeleteAll' bestätigt das Löschen evtl. bestehender Daten — das kann VORHANDENE "
+            "Datenbankinhalte unwiderruflich löschen!)\n\nNur fortfahren, wenn das gewünscht ist.",
+            parent=self.root,
+        ):
+            return
+
+        cmd = ["docker", "compose", "run", "--rm", "--no-deps",
+               "-v", f"{db_dir}:/work/{profile.db_install_dirname}",
+               "-v", f"{core_dir}:/work/mangos-src",
+               "mangosd", "bash", "-c",
+               f"cd /work/{profile.db_install_dirname} && bash ./InstallFullDB.sh"]
+        self._clear_log()
+        self._append_log(
+            "InstallFullDB.sh läuft interaktiv. Unten im Eingabefeld nacheinander eintippen und mit Enter/"
+            "Senden bestätigen: '4', dann '1', dann 'DeleteAll'. Bricht Option 3 (Core-Updates einspielen) "
+            "mit einem Fehler ab (bekannter Bash-Bug), Schritt 6 unten ('DB-Updates einspielen') danach "
+            "verwenden. 'Abbrechen' detacht sauber (Strg+P Strg+Q), der DB-Container läuft weiter."
+        )
+        self._run_pty(cmd, cwd=str(project), title=f"{profile.label}: InstallFullDB.sh")
+
+    def action_db_install_core_updates(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir():
+            return
+        if not self._tool_available("docker"):
+            messagebox.showerror("docker fehlt", "docker wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        if not profile.db_install_repo_url:
+            return
+        core_dir = self.project_dir() / DB_CORE_SUBDIR
+        if not core_dir.exists():
+            messagebox.showerror("Fehlt", "Core-Repo wurde noch nicht geklont (Schritt 2).", parent=self.root)
+            return
+
+        db_container = self._container_name(profile, "db")
+        categories = (("characters", f"{profile.key}characters"),
+                      ("realmd", f"{profile.key}realmd"),
+                      ("logs", f"{profile.key}logs"))
+
+        parts = ["set -u"]
+        for cat, db in categories:
+            base_file = core_dir / "sql" / "base" / f"{cat}.sql"
+            parts.append(f'echo "--- {cat} base schema ---"')
+            if base_file.exists():
+                parts.append(
+                    f"docker exec -i {db_container} mariadb -u{DB_USER} -p{DB_PASS} {shlex.quote(db)} "
+                    f"< {shlex.quote(str(base_file))} || true"
+                )
+            else:
+                parts.append(f'echo "  (kein sql/base/{cat}.sql gefunden, übersprungen)"')
+            parts.append(f'echo "--- {cat} updates ---"')
+            updates_dir = core_dir / "sql" / "updates" / cat
+            parts.append(
+                f'find {shlex.quote(str(updates_dir))} -name "*.sql" 2>/dev/null | sort | while read -r f; do '
+                f'echo "  $f"; docker exec -i {db_container} mariadb -u{DB_USER} -p{DB_PASS} '
+                f'{shlex.quote(db)} < "$f" 2>/dev/null; done'
+            )
+        parts.append('echo "Alle DB-Updates eingespielt (Fehler zu bereits vorhandenen Strukturen wurden ignoriert)."')
+        script = "\n".join(parts)
+
+        self._clear_log()
+        self._append_log(f"--- {profile.label}: DB-Updates (Core-Fallback) für characters/realmd/logs ---")
+        self._run(["bash", "-c", script], title=f"{profile.label}: DB-Updates (Core-Fallback)")
+
+    def action_db_install_playerbots(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir():
+            return
+        if not self._tool_available("docker"):
+            messagebox.showerror("docker fehlt", "docker wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        if not profile.db_install_repo_url:
+            return
+        pb_dir = self.project_dir() / "playerbots"
+        if not pb_dir.exists():
+            messagebox.showerror("Fehlt", "Playerbots-Repo wurde noch nicht geklont (Schritt 2).", parent=self.root)
+            return
+
+        db_container = self._container_name(profile, "db")
+        characters_db = f"{profile.key}characters"
+        world_db = profile.db_name
+        expansion_folder = profile.key  # "classic" bzw. "tbc" - passt exakt zum Ordnernamen im Playerbots-Repo
+
+        chars_glob = shlex.quote(str(pb_dir / "sql" / "characters"))
+        world_dir = pb_dir / "sql" / "world"
+        script = f'''set -u
+echo "--- Playerbots: characters-Tabellen ---"
+find {chars_glob} -name "*.sql" 2>/dev/null | sort | while read -r f; do
+    echo "Importing: $f"
+    docker exec -i {db_container} mariadb -u{DB_USER} -p{DB_PASS} {shlex.quote(characters_db)} < "$f"
+done
+echo "--- Playerbots: world-Tabellen ---"
+for f in {shlex.quote(str(world_dir / "ai_playerbot_rpg_races.sql"))} \\
+         {shlex.quote(str(world_dir / "ai_playerbot_indexes.sql"))} \\
+         {shlex.quote(str(world_dir / expansion_folder))}/*.sql \\
+         {shlex.quote(str(world_dir))}/*.sql; do
+    if [ -f "$f" ]; then
+        docker exec -i {db_container} mariadb -u{DB_USER} -p{DB_PASS} {shlex.quote(world_db)} < "$f" \\
+            2>/dev/null && echo "OK: $f"
+    fi
+done
+echo "Fertig."
+'''
+        self._clear_log()
+        self._append_log(f"--- {profile.label}: Playerbots-Tabellen einspielen ---")
+        self._run(["bash", "-c", script], title=f"{profile.label}: Playerbots-Tabellen einspielen")
+
+    def action_db_install_verify(self):
+        if self._guard_busy():
+            return
+        if not self._require_project_dir():
+            return
+        if not self._tool_available("docker"):
+            messagebox.showerror("docker fehlt", "docker wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        if not profile.db_install_repo_url:
+            return
+        self._ensure_db_install_vars(profile)
+        root_user = self.db_install_vars["root_user"].get().strip() or "root"
+        root_pass = self.db_install_vars["root_pass"].get()
+        db_container = self._container_name(profile, "db")
+        characters_db = f"{profile.key}characters"
+
+        cmd = ["docker", "exec", db_container, "mariadb", f"-u{root_user}", f"-p{root_pass}",
+               characters_db, "-e", "SHOW TABLES LIKE 'ai_playerbot%';"]
+        self._clear_log()
+        self._run(cmd, title=f"{profile.label}: Playerbot-Tabellen prüfen ({characters_db})")
 
     def action_db_clone_core(self):
         if self._guard_busy():
@@ -1018,11 +1816,23 @@ class App:
 
         from_text = self.db_from_var.get().strip()
         to_text = self.db_to_var.get().strip()
-        if not from_text.isdigit() or not to_text.isdigit():
-            messagebox.showerror("Ungültiger Bereich", "Bitte 'von' und 'bis' als reine Versionsnummern angeben "
-                                                         "(z.B. 2831 und 2837).", parent=self.root)
+        token_re = re.compile(r'^([A-Za-z]+)(\d+)$')
+        m_from, m_to = token_re.match(from_text), token_re.match(to_text)
+        if not m_from or not m_to:
+            messagebox.showerror("Ungültiger Bereich",
+                                  "Bitte 'von' und 'bis' als Buchstabe(n) + Nummer angeben (z.B. z2831 oder "
+                                  "s2000).", parent=self.root)
             return
-        from_n, to_n = int(from_text), int(to_text)
+        prefix_from, from_n = m_from.group(1), int(m_from.group(2))
+        prefix_to, to_n = m_to.group(1), int(m_to.group(2))
+        if prefix_from.lower() != prefix_to.lower():
+            messagebox.showerror("Ungültiger Bereich",
+                                  f"'von' ({prefix_from}...) und 'bis' ({prefix_to}...) müssen denselben "
+                                  "Buchstaben-Präfix verwenden. Für mehrere Präfixe (z.B. TBC: 's' und 'z') "
+                                  "diese Aktion nacheinander mit jeweils passendem Präfix ausführen.",
+                                  parent=self.root)
+            return
+        prefix = prefix_from
         if from_n > to_n:
             messagebox.showerror("Ungültiger Bereich", "'von' darf nicht größer als 'bis' sein.", parent=self.root)
             return
@@ -1034,10 +1844,10 @@ class App:
 
         files = []
         for n in range(from_n, to_n + 1):
-            files.extend(sorted(updates_dir.glob(f"z{n}_*.sql")))
+            files.extend(sorted(updates_dir.glob(f"{prefix}{n}_*.sql")))
 
         self._clear_log()
-        self._append_log(f"--- {profile.label}: SQL-Updates z{from_n} bis z{to_n} ---")
+        self._append_log(f"--- {profile.label}: SQL-Updates {prefix}{from_n} bis {prefix}{to_n} ---")
         if not files:
             self._append_log("Keine passenden SQL-Dateien in diesem Versionsbereich gefunden.")
             return
@@ -1048,8 +1858,9 @@ class App:
         save_config(self.cfg)
 
         steps = []
+        db_container = self._container_name(profile, "db")
         for f in files:
-            inner = (f"docker exec -i {DB_CONTAINER} mariadb -u{DB_USER} -p{DB_PASS} "
+            inner = (f"docker exec -i {db_container} mariadb -u{DB_USER} -p{DB_PASS} "
                      f"{shlex.quote(profile.db_name)} < {shlex.quote(str(f))}")
             steps.append(self._chain_cmd(["bash", "-c", inner], title=f"SQL-Update anwenden: {f.name}"))
         self._run_chain(steps)
@@ -1374,7 +2185,7 @@ class App:
         other_names = set()
         for key, p in PROFILES.items():
             if key != profile.key:
-                other_names.update(p.container_names)
+                other_names.update(self._current_container_names(p).values())
         running = self._running_containers(other_names)
         if running:
             proceed = messagebox.askyesno(
@@ -1417,9 +2228,70 @@ class App:
         self._run(["docker", "compose", "logs", "-f", service], cwd=str(self.project_dir()),
                    title=f"Live-Logs: {service} (mit 'Abbrechen' beenden)")
 
+    def action_db_console(self):
+        if self._guard_busy():
+            return
+        if not self._tool_available("docker"):
+            messagebox.showerror("docker fehlt", "docker wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        self._ensure_console_vars(profile)
+        container = self.console_vars["container"].get().strip()
+        user = self.console_vars["user"].get().strip()
+        password = self.console_vars["password"].get()
+        binname = self.console_vars["bin"].get().strip() or "mysql"
+        if not container or not user:
+            messagebox.showerror("Fehlende Angaben", "DB-Container und DB-User dürfen nicht leer sein.", parent=self.root)
+            return
+
+        self.cfg.setdefault("console", {})[profile.key] = {
+            "container": container, "user": user, "password": password, "bin": binname,
+        }
+        save_config(self.cfg)
+
+        cmd = ["docker", "exec", "-i", container, binname, f"-u{user}", f"-p{password}"]
+        self._clear_log()
+        self._append_log(
+            f"Verbunden mit der DB-Konsole von '{container}' ({binname}). SQL-Befehle unten eingeben (mit ';' "
+            "abschließen) und mit Enter/Senden abschicken, z.B. 'USE meinedb;' und dann 'SELECT ...;'. "
+            "'Abbrechen' beendet nur diese Sitzung — der Datenbank-Container läuft weiter."
+        )
+        self._run(cmd, title=f"{profile.label}: DB-Konsole ({container})")
+
+    def action_world_console(self):
+        if self._guard_busy():
+            return
+        if not self._tool_available("docker"):
+            messagebox.showerror("docker fehlt", "docker wurde nicht gefunden. Bitte installieren.", parent=self.root)
+            return
+        profile = self.current_profile()
+        container = self._container_name(profile, "world")
+
+        if not messagebox.askyesno(
+            "Server-Konsole öffnen",
+            f"Verbindet interaktiv mit der laufenden Konsole von '{container}' (docker attach).\n\n"
+            "GM-/Account-Befehle können unten im Eingabefeld eingegeben werden, z.B.:\n"
+            "  account create <name> <passwort> <email>\n"
+            "  account set gmlevel <name> 3\n\n"
+            "'Abbrechen' sendet die von Docker vorgesehene Detach-Tastenkombination (Strg+P Strg+Q) und "
+            "trennt damit nur diese Ansicht - der Server läuft weiter. "
+            "Der Container muss dafür bereits laufen. Fortfahren?",
+            parent=self.root,
+        ):
+            return
+
+        cmd = ["docker", "attach", "--sig-proxy=false", container]
+        self._clear_log()
+        self._append_log(
+            f"Verbunden mit der Konsole von '{container}'. Befehle unten eingeben (Enter/Senden). "
+            "'Abbrechen' detacht sauber (Strg+P Strg+Q), der Server läuft danach weiter."
+        )
+        self._run_pty(cmd, title=f"{profile.label}: Server-Konsole ({container})")
+
     def action_terminate(self):
         self.runner.terminate()
-        self._append_log("[Abbruchsignal an laufenden Vorgang gesendet]")
+        self._append_log("[Abbruch gesendet - bei einer Terminal-Sitzung (z.B. Server-Konsole) als Detach "
+                          "(Strg+P Strg+Q), sonst als Strg+C (SIGINT); falls nötig wird automatisch nachgefasst]")
 
     def _running_containers(self, names: set):
         try:
@@ -1448,3 +2320,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
